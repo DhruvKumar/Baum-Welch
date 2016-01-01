@@ -16,20 +16,46 @@
  */
 
 
-package org.apache.mahout.classifier.sequencelearning.baumwelchmapreduce;
+package org.apache.mahout.classifier.sequencelearning.hmm.hadoop;
 
+/**
+ * This class holds all config keys that are relevant to be used in the Baum-Welch MapReduce configuration.
+ */
 
 public interface BaumWelchConfigKeys {
 
+  /**
+   * Configuration key to indicate if log scaled version is to be used
+   */
+  String SCALING_OPTION_KEY = "org.apache.mahout.classifier.sequencelearning.baumwelchmapreduce.scaling";
+
+  /**
+   * Configuration key to store the number of hidden states
+   */
   String NUMBER_OF_HIDDEN_STATES_KEY = "org.apache.mahout.classifier.sequencelearning.baumwelchmapreduce.nrofhiddenstates";
 
+  /**
+   * Configuration key to store the number of emitted states
+   */
   String NUMBER_OF_EMITTED_STATES_KEY = "org.apache.mahout.classifier.sequencelearning.baumwelchmapreduce.nrofemittedstates";
 
+  /**
+   * Configuration key to store the path of the model used in the current iteration
+   */
   String MODEL_PATH_KEY = "org.apache.mahout.classifier.sequencelearning.baumwelchmapreduce.modelpath";
 
+  /**
+   * Configuration key to store the covergence delta value
+   */
   String MODEL_CONVERGENCE_KEY = "org.apache.mahout.classifier.sequencelearning.baumwelchmapreduce.comvergence";
 
+  /**
+   * Configuration key to store the mapping of hidden state IDs to integers
+   */
   String HIDDEN_STATES_MAP_PATH = "org.apache.mahout.classifier.sequencelearning.baumwelchmapreduce.hiddenstatesmap";
 
+  /**
+   * Configuration key to store the mapping of emitted state IDs to integers
+   */
   String EMITTED_STATES_MAP_PATH = "org.apache.mahout.classifier.sequencelearning.baumwelchmapreduce.emittedstatesmap";
 }

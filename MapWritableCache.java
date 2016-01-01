@@ -15,7 +15,10 @@
  * limitations under the License.
  */
 
-package org.apache.mahout.classifier.sequencelearning.baumwelchmapreduce;
+package org.apache.mahout.classifier.sequencelearning.hmm.hadoop;
+
+import java.io.IOException;
+import java.net.URI;
 
 import com.google.common.io.Closeables;
 import org.apache.hadoop.conf.Configuration;
@@ -24,18 +27,13 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.*;
 import org.apache.mahout.common.HadoopUtil;
-
-import java.io.IOException;
-import java.net.URI;
-
 import org.apache.hadoop.io.IntWritable;
 import org.apache.hadoop.io.SequenceFile;
 import org.apache.hadoop.io.Writable;
 import org.apache.mahout.common.iterator.sequencefile.SequenceFileValueIterator;
 
 /**
- * This class handles reading and writing MapWritable to the Hadoop
- * distributed cache.
+ * This class handles reading and writing MapWritable to DistributedCache
  */
 public final class MapWritableCache {
 
@@ -43,8 +41,15 @@ public final class MapWritableCache {
   }
 
   /**
-   * @param key SequenceFile key
-   * @param map Map to save
+   * Wraps a (Key, MapWritable) into a sequence file and stores it to the specified directory.
+   *
+   * @param key           key of the SequenceFile
+   * @param map           MapWritable to be stored
+   * @param output        directory where the sequence file should be stored
+   * @param conf          configuration
+   * @param overwritePath if true, overwrite the file present in the output directory
+   * @param deleteOnExit  if true. deletes the map on exiting
+   * @throws IOException
    */
   public static void save(Writable key,
                           MapWritable map,
@@ -79,6 +84,12 @@ public final class MapWritableCache {
   /**
    * Calls the save() method, setting the cache to overwrite any previous
    * Path and to delete the path after exiting
+   *
+   * @param key    sequence file Key
+   * @param map    MapWritable stored
+   * @param output path to the directory to store the sequence file
+   * @param conf   configuration object
+   * @throws IOException
    */
   public static void save(Writable key, MapWritable map, Path output, Configuration conf) throws IOException {
     save(key, map, output, conf, true, true);
@@ -97,6 +108,11 @@ public final class MapWritableCache {
 
   /**
    * Loads a MapWritable from the specified path. Returns null if no map exists.
+   *
+   * @param conf  configuration object
+   * @param input path of the MapWritable in {@link DistributedCache}
+   * @return MapWritable
+   * @throws IOException
    */
   public static MapWritable load(Configuration conf, Path input) throws IOException {
     SequenceFileValueIterator<MapWritable> iterator =
