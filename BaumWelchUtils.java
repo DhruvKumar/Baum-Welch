@@ -15,11 +15,10 @@
  * limitations under the License.
  */
 
-package org.apache.mahout.classifier.sequencelearning.baumwelchmapreduce;
+package org.apache.mahout.classifier.sequencelearning.hmm.hadoop;
 
 import com.google.common.io.Closeables;
-import org.apache.commons.lang.ArrayUtils;
-import org.apache.hadoop.classification.InterfaceAudience;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
@@ -36,14 +35,17 @@ import org.apache.mahout.math.DenseMatrix;
 import org.apache.mahout.math.DenseVector;
 import org.apache.mahout.math.Matrix;
 import org.apache.mahout.math.Vector;
-import org.jfree.util.Log;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.nio.ByteBuffer;
 
+/**
+ * Utilities to convert between HmmModel and Sequence File representation.
+ */
 
 public class BaumWelchUtils {
 
@@ -53,7 +55,17 @@ public class BaumWelchUtils {
 
   }
 
-  public static HmmModel CreateHmmModel(int nrOfHiddenStates,
+  /**
+   * Converts the sequence files present in a directory to a {@link HmmModel} model.
+   *
+   * @param nrOfHiddenStates Number of hidden states
+   * @param nrOfOutputStates Number of output states
+   * @param modelPath        Location of the sequence files containing the model's distributions
+   * @param conf             Configuration object
+   * @return HmmModel the encoded model
+   * @throws IOException
+   */
+  public static HmmModel createHmmModel(int nrOfHiddenStates,
                                         int nrOfOutputStates,
                                         Path modelPath,
                                         Configuration conf) throws IOException {
@@ -66,17 +78,15 @@ public class BaumWelchUtils {
 
     // Get the path location where the seq files encoding model are stored
     Path modelFilesPath = new Path(modelPath, "*");
-    log.info("Create Hmm Model. ModelFiles Path = {}", modelFilesPath.toUri());
+
     Collection<Path> result = new ArrayList<Path>();
 
     // get all filtered file names in result list
     FileSystem fs = modelFilesPath.getFileSystem(conf);
-    log.info("Create Hmm Model. File System = {}", fs);
     FileStatus[] matches = fs.listStatus(FileUtil.stat2Paths(fs.globStatus(modelFilesPath, PathFilters.partFilter())),
       PathFilters.partFilter());
 
     for (FileStatus match : matches) {
-      log.info("CreateHmmmModel Adding File Match {}", match.getPath().toString());
       result.add(fs.makeQualified(match.getPath()));
     }
 
@@ -84,34 +94,24 @@ public class BaumWelchUtils {
     for (Path path : result) {
       for (Pair<Writable, MapWritable> pair : new SequenceFileIterable<Writable, MapWritable>(path, true, conf)) {
         Text key = (Text) pair.getFirst();
-        log.info("CreateHmmModel Matching Seq File Key = {}", key);
         MapWritable valueMap = pair.getSecond();
-        if (key.charAt(0) == 'I') {
+        if (key.charAt(0) == (int) 'I') {
           // initial distribution stripe
           for (MapWritable.Entry<Writable, Writable> entry : valueMap.entrySet()) {
-            log.info("CreateHmmModel Initial Prob Adding  Key, Value  = ({} {})",
-              ((IntWritable) entry.getKey()).get(), ((DoubleWritable) entry.getValue()).get());
             initialProbabilities.set(((IntWritable) entry.getKey()).get(), ((DoubleWritable) entry.getValue()).get());
           }
-        } else if (key.charAt(0) == 'T') {
+        } else if (key.charAt(0) == (int) 'T') {
           // transition distribution stripe
           // key is of the form TRANSIT_0, TRANSIT_1 etc
-          // the number after _ is the state ID at char number 11
-          int stateID = Character.getNumericValue(key.charAt(8));
-          log.info("CreateHmmModel stateID = key.charAt(8) = {}", stateID);
+          int stateID = Integer.parseInt(key.toString().split("_")[1]);
           for (MapWritable.Entry<Writable, Writable> entry : valueMap.entrySet()) {
-            log.info("CreateHmmModel Transition Matrix ({}, {}) = {}",
-              new Object[]{stateID, ((IntWritable) entry.getKey()).get(), ((DoubleWritable) entry.getValue()).get()});
             transitionMatrix.set(stateID, ((IntWritable) entry.getKey()).get(), ((DoubleWritable) entry.getValue()).get());
           }
-        } else if (key.charAt(0) == 'E') {
+        } else if (key.charAt(0) == (int) 'E') {
           // emission distribution stripe
           // key is of the form EMIT_0, EMIT_1 etc
-          // the number after _ is the state ID at char number 5
-          int stateID = Character.getNumericValue(key.charAt(5));
+          int stateID = Integer.parseInt(key.toString().split("_")[1]);
           for (MapWritable.Entry<Writable, Writable> entry : valueMap.entrySet()) {
-            log.info("CreateHmmModel Emission Matrix ({}, {}) = {}",
-              new Object[]{stateID, ((IntWritable) entry.getKey()).get(), ((DoubleWritable) entry.getValue()).get()});
             emissionMatrix.set(stateID, ((IntWritable) entry.getKey()).get(), ((DoubleWritable) entry.getValue()).get());
           }
         } else {
@@ -119,21 +119,45 @@ public class BaumWelchUtils {
         }
       }
     }
+
     HmmModel model = new HmmModel(transitionMatrix, emissionMatrix, initialProbabilities);
-    HmmUtils.validate(model);
-    return model;
+
+    if (model != null) {
+      return model;
+    } else throw new IOException("Error building model from output location");
+
   }
 
-  public static void BuildRandomModel(int numHidden,
+  /**
+   * Builds a random {@link HmmModel} encoded as a Sequence File and writes it to the specified location.
+   *
+   * @param numHidden   Number of hidden states
+   * @param numObserved Number of observed states
+   * @param modelPath   Directory path for storing the created HmmModel
+   * @param conf        Configuration object
+   * @throws IOException
+   */
+
+  public static void buildRandomModel(int numHidden,
                                       int numObserved,
                                       Path modelPath,
                                       Configuration conf) throws IOException {
     HmmModel model = new HmmModel(numHidden, numObserved);
     HmmUtils.validate(model);
-    WriteModelToDirectory(model, modelPath, conf);
+    writeModelToDirectory(model, modelPath, conf);
   }
 
-  public static void BuildHmmModelFromDistributions(double[] initialProb,
+  /**
+   * Constructs a HmmModel object using the distributions and stores it as a sequence file.
+   *
+   * @param initialProb    initial hidden state probability distribution vector
+   * @param transitionProb hidden state transition probability distribution matrix
+   * @param emissionProb   emission probability distribution matrix
+   * @param modelPath      path to store the constructed {@link HmmModel}
+   * @param conf           Configuration object
+   * @throws IOException
+   */
+  public static void buildHmmModelFromDistributions(double[] initialProb,
                                                     double[][] transitionProb,
                                                     double[][] emissionProb,
                                                     Path modelPath,
@@ -141,10 +165,19 @@ public class BaumWelchUtils {
     HmmModel model = new HmmModel(new DenseMatrix(transitionProb),
       new DenseMatrix(emissionProb), new DenseVector(initialProb));
     HmmUtils.validate(model);
-    WriteModelToDirectory(model, modelPath, conf);
+    writeModelToDirectory(model, modelPath, conf);
   }
 
-  protected static void WriteModelToDirectory(HmmModel model, Path modelPath, Configuration conf) throws IOException {
+  /**
+   * Encodes a particular HmmModel as a Sequence File and write it to the specified location.
+   *
+   * @param model     HmmModel to be encoded
+   * @param modelPath Location to store the encoded model
+   * @param conf      Configuration object
+   * @throws IOException
+   */
+
+  protected static void writeModelToDirectory(HmmModel model, Path modelPath, Configuration conf) throws IOException {
 
     int numHidden = model.getNrOfHiddenStates();
     int numObserved = model.getNrOfOutputStates();
@@ -166,14 +199,9 @@ public class BaumWelchUtils {
       SequenceFile.Writer writer = SequenceFile.createWriter(fs, conf, outFile, Text.class, MapWritable.class);
 
       try {
-
-        // construct one MapWritable<IntWritable, DoubleWritable> object
-        // and two MapWritable<Text, MapWritable<IntWritable, DoubleWritable >> objects
         for (int i = 0; i < numHidden; i++) {
           IntWritable initialDistributionKey = new IntWritable(i);
           DoubleWritable initialDistributionValue = new DoubleWritable(initialProbability.get(i));
-          log.info("BuildRandomModel Initial Distribution Map: State {} = {})",
-            initialDistributionKey.get(), initialDistributionValue.get());
           initialDistributionMap.put(initialDistributionKey, initialDistributionValue);
 
           Text transitionDistributionKey = new Text("TRANSIT_" + Integer.toString(i));
@@ -181,8 +209,6 @@ public class BaumWelchUtils {
           for (int j = 0; j < numHidden; j++) {
             IntWritable transitionDistributionInnerKey = new IntWritable(j);
             DoubleWritable transitionDistributionInnerValue = new DoubleWritable(transitionMatrix.get(i, j));
-            log.info("BuildRandomModel Transition Distribution Map Inner: ({}, {}) = ({}, {})",
-              new Object[]{i, j, transitionDistributionInnerKey.get(), transitionDistributionInnerValue.get()});
             transitionDistributionValue.put(transitionDistributionInnerKey, transitionDistributionInnerValue);
           }
           transitionDistributionMap.put(transitionDistributionKey, transitionDistributionValue);
@@ -192,27 +218,20 @@ public class BaumWelchUtils {
           for (int j = 0; j < numObserved; j++) {
             IntWritable emissionDistributionInnerKey = new IntWritable(j);
             DoubleWritable emissionDistributionInnerValue = new DoubleWritable(emissionMatrix.get(i, j));
-            log.info("BuildRandomModel Emission Distribution Map Inner: ({}, {}) = ({}, {})",
-              new Object[]{i, j, emissionDistributionInnerKey.get(), emissionDistributionInnerValue.get()});
             emissionDistributionValue.put(emissionDistributionInnerKey, emissionDistributionInnerValue);
           }
           emissionDistributionMap.put(emissionDistributionKey, emissionDistributionValue);
-
         }
 
         writer.append(new Text("INITIAL"), initialDistributionMap);
         log.info("Wrote random Initial Distribution Map to {}", outFile);
-
         for (MapWritable.Entry<Writable, Writable> transitionEntry : transitionDistributionMap.entrySet()) {
-          log.info("Writing Transition Distribution Map Key, Value = ({}, {})",
-            transitionEntry.getKey(), transitionEntry.getValue());
+
           writer.append(transitionEntry.getKey(), transitionEntry.getValue());
         }
         log.info("Wrote random Transition Distribution Map to {}", outFile);
 
         for (MapWritable.Entry<Writable, Writable> emissionEntry : emissionDistributionMap.entrySet()) {
-          log.info("Writing Emission Distribution Map Key, Value = ({}, {})",
-            emissionEntry.getKey(), emissionEntry.getValue());
           writer.append(emissionEntry.getKey(), emissionEntry.getValue());
         }
         log.info("Wrote random Emission Distribution Map to {}", outFile);
@@ -226,7 +245,7 @@ public class BaumWelchUtils {
   }
 
   /**
-   * Check convergence of two HMM models by computing a simple distance between
+   * Checks convergence of two HMM models by computing a simple distance between
    * emission / transition matrices
    *
    * @param oldModel Old HMM Model
@@ -234,7 +253,7 @@ public class BaumWelchUtils {
    * @param epsilon  Convergence Factor
    * @return true if training converged to a stable state.
    */
-  public static boolean CheckConvergence(HmmModel oldModel, HmmModel newModel,
+  public static boolean checkConvergence(HmmModel oldModel, HmmModel newModel,
                                          double epsilon) {
     // check convergence of transitionProbabilities
     Matrix oldTransitionMatrix = oldModel.getTransitionMatrix();
@@ -261,7 +280,20 @@ public class BaumWelchUtils {
       }
     }
     norm += Math.sqrt(diff);
-    // iteration has converged :)
+
     return norm < epsilon;
   }
+
+    public static byte[] doublePairToByteArray(double d1, double d2) {
+      byte[] bytes = new byte[16];
+      ByteBuffer.wrap(bytes).putDouble(d1);
+      ByteBuffer.wrap(bytes).putDouble(8, d2);
+      return bytes;
+  }
+    public static double[] toDoublePair(byte[] bytes) {
+	double[] pair = new double[2];
+	pair[0] = ByteBuffer.wrap(bytes).getDouble();
+	pair[1] = ByteBuffer.wrap(bytes).getDouble(8);
+	return pair;
+    }
 }

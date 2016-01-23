@@ -15,34 +15,59 @@
  * limitations under the License.
  */
 
-package org.apache.mahout.classifier.sequencelearning.baumwelchmapreduce;
+package org.apache.mahout.classifier.sequencelearning.hmm.hadoop;
 
 import java.io.IOException;
 import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.Set;
 
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.*;
 import org.apache.hadoop.mapreduce.Mapper;
-
-import org.apache.lucene.analysis.CharArrayMap;
 import org.apache.mahout.classifier.sequencelearning.hmm.HmmAlgorithms;
 import org.apache.mahout.classifier.sequencelearning.hmm.HmmModel;
 import org.apache.mahout.classifier.sequencelearning.hmm.HmmUtils;
-import org.apache.mahout.clustering.kmeans.KMeansConfigKeys;
-import org.apache.mahout.math.DenseMatrix;
 import org.apache.mahout.math.Matrix;
 import org.apache.mahout.math.Vector;
-import org.apache.mahout.math.hadoop.DistributedRowMatrix;
+import org.apache.mahout.math.VectorWritable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * The mappers perform the first part of the Expectation step by calculating expected counts using the current iteration's model parameters.
+ * The reducers finish the Expectation started here,
+ * and also perform the Maximization step to calculate the parameters for the next MapReduce iteration.
+ * <p/>
+ * The input consists of sequence file with LongWritable keys denoting sequence IDs and the Values as Vector Writable wrapping the observed integer sequence.
+ * The goal of the Mapper is to calculate and emit posterior probabilities for its input split.
+ * The probabilities are wrapped in MapWritables.
+ * <p/>
+ * Each mapper generates 2n + 1 unique keys, where n is the number of hidden states, with the following scheme:
+ * <p/>
+ * For Initial Distribution:
+ * key = INITIAL
+ * value = MapWritable<hiddenStateID, initial probability>
+ * <p/>
+ * For Transition Distribution:
+ * key = TRANSIT_0, TRANSIT_1 etc.
+ * value =  MapWritable<hiddenStateID, transition probability>
+ * <p/>
+ * The suffixes to TRANSIT_ denote the hidden state from which the transitions are encoded in the value map
+ * <p/>
+ * eg: key = TRANSIT_0, value = <(0, 0.1), (1, 0.8), (2, 0.1)>
+ * <p/>
+ * For Emission Distribution:
+ * key = EMIT_0, EMIT_1 etc.
+ * value =  MapWritable<emissionStateID, emission probability>
+ * <p/>
+ * The suffixes to EMIT_ denote the hidden state from which the emissions are encoded in the value map
+ * <p/>
+ * eg: key = EMIT_0, value = <(0, 0.1), (1, 0.8), (2, 0.1)>
+ */
+
+
 public class BaumWelchMapper extends
-  Mapper<LongWritable, IntArrayWritable, Text, MapWritable> {
+  Mapper<LongWritable, VectorWritable, Text, MapWritable> {
 
   private static final Logger log = LoggerFactory.getLogger(BaumWelchMapper.class);
 
@@ -50,21 +75,27 @@ public class BaumWelchMapper extends
   private Integer nrOfEmittedStates;
   private Path modelPath;
   private HmmModel Model;
+  private HmmAlgorithms.ScalingMethod scaling = HmmAlgorithms.ScalingMethod.NOSCALING;
 
   @Override
   public void setup(Context context) throws IOException, InterruptedException {
+
     super.setup(context);
     Configuration config = context.getConfiguration();
 
+    String scalingMethod = config.get(BaumWelchConfigKeys.SCALING_OPTION_KEY);
+
+	if (scalingMethod.equals("rescaling")) {
+		scaling = HmmAlgorithms.ScalingMethod.RESCALING;
+	}
+	else 	if (scalingMethod.equals("logscaling")) {
+		scaling = HmmAlgorithms.ScalingMethod.LOGSCALING;
+	}
+	
     nrOfHiddenStates = Integer.parseInt(config.get(BaumWelchConfigKeys.NUMBER_OF_HIDDEN_STATES_KEY));
     nrOfEmittedStates = Integer.parseInt(config.get(BaumWelchConfigKeys.NUMBER_OF_EMITTED_STATES_KEY));
     MapWritable hiddenStatesWritableMap = MapWritableCache.load(config, new Path(config.get(BaumWelchConfigKeys.HIDDEN_STATES_MAP_PATH)));
-    log.info("Mapper Setup hiddenStatesWritableMap loaded. Number of entries = {}", hiddenStatesWritableMap.size());
     MapWritable emittedStatesWritableMap = MapWritableCache.load(config, new Path(config.get(BaumWelchConfigKeys.EMITTED_STATES_MAP_PATH)));
-    log.info("Mapper Setup emittedStatesWritableMap loaded. Number of entries = {}", emittedStatesWritableMap.size());
-
-    //HashMap hiddenStatesMap = new HashMap();
-    //HashMap emittedStatesMap = new HashMap();
 
     String[] hiddenStatesArray = new String[hiddenStatesWritableMap.size()];
     String[] emittedStatesArray = new String[emittedStatesWritableMap.size()];
@@ -73,140 +104,213 @@ public class BaumWelchMapper extends
     int l = 0;
 
     for (MapWritable.Entry<Writable, Writable> entry : hiddenStatesWritableMap.entrySet()) {
-      log.info("Mapper Setup hiddenStateMap adding pair ({} ,{})", ((Text) (entry.getKey())).toString(), ((IntWritable) (entry.getValue())).get());
-      //hiddenStatesMap.put( ((Text)(entry.getKey())).toString(), ((IntWritable)(entry.getValue())).get() );
-      hiddenStatesArray[k++] = ((Text) (entry.getKey())).toString();
+      hiddenStatesArray[k++] = ((entry.getKey())).toString();
     }
 
     for (MapWritable.Entry<Writable, Writable> entry : emittedStatesWritableMap.entrySet()) {
-      log.info("Mapper Setup emittedStateMap adding pair ({} ,{})", ((Text) (entry.getKey())).toString(), ((IntWritable) (entry.getValue())).get());
-      //emittedStatesMap.put( ((Text)(entry.getKey())).toString(), ((IntWritable)(entry.getValue())).get() );
-      emittedStatesArray[l++] = ((Text) (entry.getKey())).toString();
+      emittedStatesArray[l++] = ((entry.getKey())).toString();
     }
 
-
     modelPath = new Path(config.get(BaumWelchConfigKeys.MODEL_PATH_KEY));
-    Model = BaumWelchUtils.CreateHmmModel(nrOfHiddenStates, nrOfEmittedStates, modelPath, config);
+    Model = BaumWelchUtils.createHmmModel(nrOfHiddenStates, nrOfEmittedStates, modelPath, config);
     Model.registerHiddenStateNames(hiddenStatesArray);
     Model.registerOutputStateNames(emittedStatesArray);
+    HmmUtils.normalizeModel(Model);
     HmmUtils.validate(Model);
 
     log.info("Mapper Setup Hmm Model Created. Hidden States = {} Emitted States = {}", Model.getNrOfHiddenStates(), Model.getNrOfOutputStates());
-    Vector initialPr = Model.getInitialProbabilities();
-    Matrix transitionPr = Model.getTransitionMatrix();
-    Matrix emissionPr = Model.getEmissionMatrix();
 
-
-    for (int i = 0; i < Model.getNrOfHiddenStates(); i++) {
-      log.info("Mapper Setup Hmm Model Initial Prob Vector. State {} = {}", i, initialPr.get(i));
-    }
-
-
-    for (int i = 0; i < Model.getNrOfHiddenStates(); i++) {
-      for (int j = 0; j < Model.getNrOfHiddenStates(); j++) {
-        log.info("Mapper Setup Hmm Model Transition Prob Matrix ({}, {}) = {} ", new Object[]{i, j, transitionPr.get(i, j)});
-      }
-    }
-
-
-    for (int i = 0; i < Model.getNrOfHiddenStates(); i++) {
-      for (int j = 0; j < Model.getNrOfOutputStates(); j++) {
-        log.info("Mapper Setup Hmm Model Emission Prob Matrix. ({}, {}) = {}", new Object[]{i, j, emissionPr.get(i, j)});
-      }
-    }
   }
 
   @Override
-  public void map(LongWritable seqID, IntArrayWritable seq, Context context)
+  public void map(LongWritable seqID, VectorWritable seq, Context context)
     throws IOException, InterruptedException {
 
     MapWritable initialDistributionStripe = new MapWritable();
-    MapWritable transitionDistributionStripe = new MapWritable();
-    MapWritable emissionDistributionStripe = new MapWritable();
+    HashMap<Integer, MapWritable> transitionDistributionStripe = new HashMap<Integer, MapWritable>();
+    HashMap<Integer, MapWritable> emissionDistributionStripe = new HashMap<Integer, MapWritable>();
 
-
-    //IntArrayWritable[] writableSequence = (IntArrayWritable[])seq.get();
-    //int[] sequence = new int[seq.get().length];
-    int[] sequence = new int[seq.get().length];
+    Vector vec = seq.get();
+    log.info("Sequence Length = {}", vec.size());
+    int[] sequence = new int[vec.size()];
 
     int n = 0;
-    for (Writable val : seq.get()) {
-      sequence[n] = ((IntWritable) val).get();
+
+    for (int idx = 0; idx < vec.size(); idx++) {
+	int val = (int) (vec.getElement(idx)).get();
+      sequence[n] = val;
       n++;
     }
 
-    for (int k = 0; k < sequence.length; k++) {
-      log.info("Sequence Array {}", Integer.toString(sequence[k]));
-    }
-
-
-    Matrix alphaFactors = HmmAlgorithms.forwardAlgorithm(Model, sequence, false);
-    for (int i = 0; i < alphaFactors.numRows(); i++) {
-      for (int j = 0; j < alphaFactors.numCols(); j++) {
-        log.info("Alpha Factors Matrix entry ({}, {}) = {}", new Object[]{i, j, alphaFactors.get(i, j)});
-      }
-    }
-
-
-    Matrix betaFactors = HmmAlgorithms.backwardAlgorithm(Model, sequence, false);
-    for (int i = 0; i < betaFactors.numRows(); i++) {
-      for (int j = 0; j < betaFactors.numCols(); j++) {
-        log.info("Beta Factors Matrix entry ({}, {}) = {}", new Object[]{i, j, betaFactors.get(i, j)});
-      }
+    if (scaling == HmmAlgorithms.ScalingMethod.LOGSCALING) {
+		Matrix alphaFactors = HmmAlgorithms.forwardAlgorithm(Model, sequence, HmmAlgorithms.ScalingMethod.LOGSCALING, null);
+      Matrix betaFactors = HmmAlgorithms.backwardAlgorithm(Model, sequence, HmmAlgorithms.ScalingMethod.LOGSCALING, null);
 
       //Initial Distribution
       for (int q = 0; q < nrOfHiddenStates; q++) {
-        double alpha_1_q = alphaFactors.get(1, q);
-        double beta_1_q = betaFactors.get(1, q);
-        initialDistributionStripe.put(new IntWritable(q), new DoubleWritable(alpha_1_q * beta_1_q));
-      }
-
-      //Emission Distribution
-      /*
-    Matrix emissionMatrix = new DenseMatrix(nrOfHiddenStates, sequence.length);
-    for (int t = 0; t < sequence.length; t++) {
-      HashMap<Integer, Double> innerMap = new HashMap<Integer, Double>();
-      for (int q = 0; q < nrOfHiddenStates; q++) {
-        double alpha_t_q = alphaFactors.get(t, q);
-        double beta_t_q  = betaFactors.get(t, q);
-        //innerMap.put(q, alpha_t_q * beta_t_q);
-        emissionMatrix.set(q, t, alpha_t_q * beta_t_q);
+        double alpha_1_q = alphaFactors.get(0, q);
+        double beta_1_q = betaFactors.get(0, q);
+        if ((alpha_1_q + beta_1_q) > Double.NEGATIVE_INFINITY) {
+          initialDistributionStripe.put(new IntWritable(q), new DoubleWritable(alpha_1_q + beta_1_q));
         }
-    }
-    for (int q = 0; q < nrOfHiddenStates; q++) {
-      Map innerEmissionMap = new MapWritable();
-      for (int xt = 0; xt < sequence.length; xt++) {
-        innerEmissionMap.put(new IntWritable(xt), new DoubleWritable(emissionMatrix.get(q, xt)));
       }
-      emissionDistributionStripe.put(new IntWritable(q), (MapWritable)innerEmissionMap);
-    }
-    */
 
 
+      //Transition Distribution
+      double[][] transitionMatrix = new double[nrOfHiddenStates][nrOfHiddenStates];
+      for (int q = 0; q < nrOfHiddenStates; q++) {
+        for (int x = 0; x < nrOfHiddenStates; x++) {
+          transitionMatrix[q][x] = Double.NEGATIVE_INFINITY;
+        }
+      }
+
+      for (int t = 0; t < sequence.length - 1; t++) {
+        for (int q = 0; q < nrOfHiddenStates; q++) {
+          for (int r = 0; r < nrOfHiddenStates; r++) {
+            double alpha_t_q = alphaFactors.get(t, q);
+            double A_q_r = Model.getTransitionMatrix().get(q, r) > 0 ?
+              Math.log(Model.getTransitionMatrix().get(q, r)) : Double.NEGATIVE_INFINITY;
+            double B_r_xtplus1 = Model.getEmissionMatrix().get(r, sequence[t + 1]) > 0 ?
+              Math.log(Model.getEmissionMatrix().get(r, sequence[t + 1])) : Double.NEGATIVE_INFINITY;
+            double beta_tplus1_r = betaFactors.get(t + 1, r);
+            double transitionProb = alpha_t_q + A_q_r + B_r_xtplus1 + beta_tplus1_r;
+            if (transitionProb > Double.NEGATIVE_INFINITY) {
+              transitionMatrix[q][r] = transitionProb + Math.log(1 + Math.exp(transitionMatrix[q][r] - transitionProb));
+            }
+          }
+        }
+      }
+      for (int q = 0; q < nrOfHiddenStates; q++) {
+        MapWritable innerMap = new MapWritable();
+        for (int r = 0; r < nrOfHiddenStates; r++) {
+          if (transitionMatrix[q][r] > Double.NEGATIVE_INFINITY) {
+            innerMap.put(new IntWritable(r), new DoubleWritable(transitionMatrix[q][r]));
+          }
+        }
+        transitionDistributionStripe.put(q, innerMap);
+      }
+
+
+      //Emission distribution
       double[][] emissionMatrix = new double[nrOfHiddenStates][nrOfEmittedStates];
-
       for (int q = 0; q < nrOfHiddenStates; q++) {
         for (int x = 0; x < nrOfEmittedStates; x++) {
-          emissionMatrix[q][x] = 0.0;
+          emissionMatrix[q][x] = Double.NEGATIVE_INFINITY;
         }
       }
-
       for (int t = 0; t < sequence.length; t++) {
-        //HashMap<Integer, Double> innerMap = new HashMap<Integer, Double>();
         for (int q = 0; q < nrOfHiddenStates; q++) {
           double alpha_t_q = alphaFactors.get(t, q);
           double beta_t_q = betaFactors.get(t, q);
-          //innerMap.put(q, alpha_t_q * beta_t_q);
-          //emissionMatrix.set(q, t, alpha_t_q * beta_t_q);
-          emissionMatrix[q][sequence[t]] += alpha_t_q * beta_t_q;
+          double sum = alpha_t_q + beta_t_q;
+          double max = sum > emissionMatrix[q][sequence[t]] ? sum : emissionMatrix[q][sequence[t]];
+          if (sum > Double.NEGATIVE_INFINITY) {
+            emissionMatrix[q][sequence[t]] = sum + Math.log(1 + Math.exp(emissionMatrix[q][sequence[t]] - sum));
+          }
+
         }
       }
       for (int q = 0; q < nrOfHiddenStates; q++) {
-        Map innerEmissionMap = new MapWritable();
-        for (int xt = 0; xt < sequence.length; xt++) {
-          innerEmissionMap.put(new IntWritable(sequence[xt]), new DoubleWritable(emissionMatrix[q][sequence[xt]]));
+        MapWritable innerMap = new MapWritable();
+        for (int r = 0; r < nrOfEmittedStates; r++) {
+          if (emissionMatrix[q][r] > Double.NEGATIVE_INFINITY) {
+            innerMap.put(new IntWritable(r), new DoubleWritable(emissionMatrix[q][r]));
+          }
         }
-        emissionDistributionStripe.put(new IntWritable(q), (MapWritable) innerEmissionMap);
+        emissionDistributionStripe.put(q, innerMap);
+      }
+    } else if (scaling == HmmAlgorithms.ScalingMethod.RESCALING) {
+		double[] scalingFactors = new double[vec.size()];
+		
+		Matrix alphaFactors = HmmAlgorithms.forwardAlgorithm(Model, sequence, HmmAlgorithms.ScalingMethod.RESCALING, scalingFactors);
+		Matrix betaFactors = HmmAlgorithms.backwardAlgorithm(Model, sequence, HmmAlgorithms.ScalingMethod.RESCALING, scalingFactors);
+
+      //Initial Distribution
+      for (int q = 0; q < nrOfHiddenStates; q++) {
+        double alpha_1_q = alphaFactors.get(0, q);
+        double beta_1_q = betaFactors.get(0, q);
+	initialDistributionStripe.put(new IntWritable(q), new DoubleWritable(alpha_1_q * beta_1_q / scalingFactors[0]));
+      }
+
+	  //Transition Distribution
+      double[][] transitionMatrixNum = new double[nrOfHiddenStates][nrOfHiddenStates];
+      double[][] transitionMatrixDenom = new double[nrOfHiddenStates][nrOfHiddenStates];
+      for (int q = 0; q < nrOfHiddenStates; q++) {
+        for (int x = 0; x < nrOfHiddenStates; x++) {
+	    transitionMatrixNum[q][x] = 0.0;
+	    transitionMatrixDenom[q][x] = 0.0;
+        }
+      }
+
+      for (int t = 0; t < sequence.length - 1; t++) {
+        for (int q = 0; q < nrOfHiddenStates; q++) {
+          for (int r = 0; r < nrOfHiddenStates; r++) {
+            double alpha_t_q = alphaFactors.get(t, q);
+            double A_q_r = Model.getTransitionMatrix().get(q, r);
+            double B_r_xtplus1 = Model.getEmissionMatrix().get(r, sequence[t + 1]);
+            double beta_tplus1_r = betaFactors.get(t + 1, r);
+            double beta_t_q = betaFactors.get(t, q);
+            double transitionProbNum = alpha_t_q * A_q_r * B_r_xtplus1 * beta_tplus1_r;
+            double transitionProbDenom = alpha_t_q * beta_t_q/scalingFactors[t];
+            transitionMatrixNum[q][r] += transitionProbNum;
+            transitionMatrixDenom[q][r] += transitionProbDenom;
+          }
+        }
+      }
+      for (int q = 0; q < nrOfHiddenStates; q++) {
+        MapWritable innerMap = new MapWritable();
+        for (int r = 0; r < nrOfHiddenStates; r++) {
+	    byte [] doublePair = BaumWelchUtils.doublePairToByteArray(transitionMatrixNum[q][r], transitionMatrixDenom[q][r]);
+	    innerMap.put(new IntWritable(r), new BytesWritable(doublePair));
+        }
+        transitionDistributionStripe.put(q, innerMap);
+      }
+
+
+      //Emission distribution
+      double[][] emissionMatrixNum = new double[nrOfHiddenStates][nrOfEmittedStates];
+      double[][] emissionMatrixDenom = new double[nrOfHiddenStates][nrOfEmittedStates];
+      for (int q = 0; q < nrOfHiddenStates; q++) {
+        for (int x = 0; x < nrOfEmittedStates; x++) {
+          emissionMatrixNum[q][x] = 0.0;
+          emissionMatrixDenom[q][x] = 0.0;
+        }
+      }
+
+      for (int q = 0; q < nrOfHiddenStates; ++q) {
+	  for (int j = 0; j < nrOfEmittedStates; ++j) {
+	      double temp = 0;
+	      double temp1 = 0;
+	      for (int t = 0; t < sequence.length; ++t) {
+		  // delta tensor
+		  if (sequence[t] == j) {
+		      temp += alphaFactors.get(t, q) * betaFactors.get(t, q)/scalingFactors[t];
+		  }
+		  temp1 += alphaFactors.get(t, q) * betaFactors.get(t, q)/scalingFactors[t];
+	      }
+	      emissionMatrixNum[q][j] += temp;
+	      emissionMatrixDenom[q][j] += temp1;
+	  }
+      }
+
+      for (int q = 0; q < nrOfHiddenStates; q++) {
+        MapWritable innerMap = new MapWritable();
+        for (int r = 0; r < nrOfEmittedStates; r++) {
+	    byte [] doublePair = BaumWelchUtils.doublePairToByteArray(emissionMatrixNum[q][r], emissionMatrixDenom[q][r]);
+	    innerMap.put(new IntWritable(r), new BytesWritable(doublePair));
+        }
+        emissionDistributionStripe.put(q, innerMap);
+      }
+    } else {
+		Matrix alphaFactors = HmmAlgorithms.forwardAlgorithm(Model, sequence, HmmAlgorithms.ScalingMethod.NOSCALING, null);
+		Matrix betaFactors = HmmAlgorithms.backwardAlgorithm(Model, sequence, HmmAlgorithms.ScalingMethod.NOSCALING, null);
+
+
+      //Initial Distribution
+      for (int q = 0; q < nrOfHiddenStates; q++) {
+        double alpha_1_q = alphaFactors.get(0, q);
+        double beta_1_q = betaFactors.get(0, q);
+        initialDistributionStripe.put(new IntWritable(q), new DoubleWritable(alpha_1_q * beta_1_q));
       }
 
 
@@ -226,37 +330,52 @@ public class BaumWelchMapper extends
             double B_r_xtplus1 = Model.getEmissionMatrix().get(r, sequence[t + 1]);
             double beta_tplus1_r = betaFactors.get(t + 1, r);
             double transitionProb = alpha_t_q * A_q_r * B_r_xtplus1 * beta_tplus1_r;
-            log.info("Putting into Inner Map of Transition Distribution. Key = {}, Value = {}", q, transitionProb);
             transitionMatrix[q][r] += transitionProb;
           }
         }
       }
       for (int q = 0; q < nrOfHiddenStates; q++) {
-        Map innerTransitionMap = new MapWritable();
+        MapWritable innerMap = new MapWritable();
         for (int r = 0; r < nrOfHiddenStates; r++) {
-          innerTransitionMap.put(new IntWritable(r), new DoubleWritable(transitionMatrix[q][r]));
+          innerMap.put(new IntWritable(r), new DoubleWritable(transitionMatrix[q][r]));
         }
-        transitionDistributionStripe.put(new IntWritable(q), (MapWritable) innerTransitionMap);
+        transitionDistributionStripe.put(q, innerMap);
       }
 
 
-      context.write(new Text("INITIAL"), initialDistributionStripe);
-      log.info("Context Writing from Mapper the Initial Distribution Stripe. Size = {}  Entries = {}", Integer.toString(initialDistributionStripe.size()), Integer.toString(initialDistributionStripe.entrySet().size()));
+      //Emission distribution
+      double[][] emissionMatrix = new double[nrOfHiddenStates][nrOfEmittedStates];
       for (int q = 0; q < nrOfHiddenStates; q++) {
-        context.write(new Text("EMIT_" + Integer.toString(q)), (MapWritable) emissionDistributionStripe.get(new IntWritable(q)));
-        log.info("Context Writing from Mapper the Emission Distribution Stripe. State = {}  Entries = {}", Integer.toString(q), Integer.toString(((MapWritable) emissionDistributionStripe.get(new IntWritable(q))).size()));
-        for (MapWritable.Entry<Writable, Writable> entry : ((MapWritable) emissionDistributionStripe.get(new IntWritable(q))).entrySet()) {
-          log.info("Emission Distribution Stripe Details. Key = {}  Value = {} ", Integer.toString(((IntWritable) entry.getKey()).get()), Double.toString(((DoubleWritable) entry.getValue()).get()));
+        for (int x = 0; x < nrOfEmittedStates; x++) {
+          emissionMatrix[q][x] = 0.0;
         }
-        context.write(new Text("TRANSIT_" + Integer.toString(q)), (MapWritable) transitionDistributionStripe.get(new IntWritable(q)));
-        log.info("Context Writing from Mapper the Transition Distribution Stripe. State = {}  Entries = {}", Integer.toString(q), Integer.toString(((MapWritable) transitionDistributionStripe.get(new IntWritable(q))).size()));
-        for (MapWritable.Entry<Writable, Writable> entry : ((MapWritable) transitionDistributionStripe.get(new IntWritable(q))).entrySet()) {
-          log.info("Transition Distribution Stripe Details. Key = {}  Value = {} ", Integer.toString(((IntWritable) entry.getKey()).get()), Double.toString(((DoubleWritable) entry.getValue()).get()));
+      }
+      for (int t = 0; t < sequence.length; t++) {
+        for (int q = 0; q < nrOfHiddenStates; q++) {
+
+          double alpha_t_q = alphaFactors.get(t, q);
+          double beta_t_q = betaFactors.get(t, q);
+          emissionMatrix[q][sequence[t]] += alpha_t_q * beta_t_q;
+
         }
+      }
+      for (int q = 0; q < nrOfHiddenStates; q++) {
+        MapWritable innerMap = new MapWritable();
+        for (int r = 0; r < nrOfEmittedStates; r++) {
+          innerMap.put(new IntWritable(r), new DoubleWritable(emissionMatrix[q][r]));
+        }
+        emissionDistributionStripe.put(q, innerMap);
       }
 
     }
+
+    //push out the associative arrays
+    context.write(new Text("INITIAL"), initialDistributionStripe);
+    for (int q = 0; q < nrOfHiddenStates; q++) {
+      context.write(new Text("EMIT_" + Integer.toString(q)), emissionDistributionStripe.get(q));
+      context.write(new Text("TRANSIT_" + Integer.toString(q)), transitionDistributionStripe.get(q));
+    }
+
+
   }
-
-
 }
